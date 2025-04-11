@@ -2,6 +2,7 @@ import inspect
 import logging
 import typing
 import warnings
+from collections import defaultdict
 from functools import partial
 from inspect import isclass, isfunction, ismethod, signature
 from types import FunctionType
@@ -35,7 +36,16 @@ from langgraph.channels.dynamic_barrier_value import DynamicBarrierValue, WaitFo
 from langgraph.channels.ephemeral_value import EphemeralValue
 from langgraph.channels.last_value import LastValue
 from langgraph.channels.named_barrier_value import NamedBarrierValue
-from langgraph.constants import EMPTY_SEQ, MISSING, NS_END, NS_SEP, SELF, TAG_HIDDEN
+from langgraph.checkpoint.base import Checkpoint
+from langgraph.constants import (
+    EMPTY_SEQ,
+    INTERRUPT,
+    MISSING,
+    NS_END,
+    NS_SEP,
+    TAG_HIDDEN,
+    TASKS,
+)
 from langgraph.errors import (
     ErrorCode,
     InvalidUpdateError,
@@ -69,7 +79,7 @@ from langgraph.store.base import BaseStore
 from langgraph.types import All, Checkpointer, Command, RetryPolicy
 from langgraph.utils.fields import get_field_default
 from langgraph.utils.pydantic import create_model
-from langgraph.utils.runnable import RunnableCallable, RunnableLike, coerce_to_runnable
+from langgraph.utils.runnable import RunnableLike, coerce_to_runnable
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +109,7 @@ class StateNodeSpec(NamedTuple):
     runnable: Runnable
     metadata: Optional[dict[str, Any]]
     input: Type[Any]
-    retry_policy: Optional[RetryPolicy]
+    retry_policy: Optional[Union[RetryPolicy, Sequence[RetryPolicy]]]
     ends: Optional[Union[tuple[str, ...], dict[str, str]]] = EMPTY_SEQ
 
 
@@ -241,8 +251,8 @@ class StateGraph(Graph):
         *,
         metadata: Optional[dict[str, Any]] = None,
         input: Optional[Type[Any]] = None,
-        retry: Optional[RetryPolicy] = None,
-        destinations: Optional[Union[dict[str, str], tuple[str]]] = None,
+        retry: Optional[Union[RetryPolicy, Sequence[RetryPolicy]]] = None,
+        destinations: Optional[Union[dict[str, str], tuple[str, ...]]] = None,
     ) -> Self:
         """Adds a new node to the state graph.
         Will take the name of the function/runnable as the node name.
@@ -266,8 +276,8 @@ class StateGraph(Graph):
         *,
         metadata: Optional[dict[str, Any]] = None,
         input: Optional[Type[Any]] = None,
-        retry: Optional[RetryPolicy] = None,
-        destinations: Optional[Union[dict[str, str], tuple[str]]] = None,
+        retry: Optional[Union[RetryPolicy, Sequence[RetryPolicy]]] = None,
+        destinations: Optional[Union[dict[str, str], tuple[str, ...]]] = None,
     ) -> Self:
         """Adds a new node to the state graph.
 
@@ -290,8 +300,8 @@ class StateGraph(Graph):
         *,
         metadata: Optional[dict[str, Any]] = None,
         input: Optional[Type[Any]] = None,
-        retry: Optional[RetryPolicy] = None,
-        destinations: Optional[Union[dict[str, str], tuple[str]]] = None,
+        retry: Optional[Union[RetryPolicy, Sequence[RetryPolicy]]] = None,
+        destinations: Optional[Union[dict[str, str], tuple[str, ...]]] = None,
     ) -> Self:
         """Adds a new node to the state graph.
 
@@ -302,8 +312,9 @@ class StateGraph(Graph):
             action (Optional[RunnableLike]): The action associated with the node. (default: None)
             metadata (Optional[dict[str, Any]]): The metadata associated with the node. (default: None)
             input (Optional[Type[Any]]): The input schema for the node. (default: the graph's input schema)
-            retry (Optional[RetryPolicy]): The policy for retrying the node. (default: None)
-            destinations (Optional[Union[dict[str, str], tuple[str]]]): Destinations that indicate where a node can route to.
+            retry (Optional[Union[RetryPolicy, Sequence[RetryPolicy]]]): The policy for retrying the node. (default: None)
+                If a sequence is provided, the first matching policy will be applied.
+            destinations (Optional[Union[dict[str, str], tuple[str, ...]]]): Destinations that indicate where a node can route to.
                 This is useful for edgeless graphs with nodes that return `Command` objects.
                 If a dict is provided, the keys will be used as the target node names and the values will be used as the labels for the edges.
                 If a tuple is provided, the values will be used as the target node names.
@@ -628,6 +639,7 @@ class StateGraph(Graph):
 
         compiled = CompiledStateGraph(
             builder=self,
+            schema_to_mapper={},
             config_type=self.config_schema,
             input_model=(
                 self.input
@@ -659,10 +671,6 @@ class StateGraph(Graph):
         for key, node in self.nodes.items():
             compiled.attach_node(key, node)
 
-        compiled.attach_branch(START, SELF, CONTROL_BRANCH, with_reader=False)
-        for key, node in self.nodes.items():
-            compiled.attach_branch(key, SELF, CONTROL_BRANCH, with_reader=False)
-
         for start, end in self.edges:
             compiled.attach_edge(start, end)
 
@@ -678,6 +686,16 @@ class StateGraph(Graph):
 
 class CompiledStateGraph(CompiledGraph):
     builder: StateGraph
+    schema_to_mapper: dict[Type[Any], Optional[Callable[[Any], Any]]]
+
+    def __init__(
+        self,
+        *,
+        schema_to_mapper: dict[Type[Any], Optional[Callable[[Any], Any]]],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.schema_to_mapper = schema_to_mapper
 
     def get_input_schema(
         self, config: Optional[RunnableConfig] = None
@@ -713,28 +731,6 @@ class CompiledStateGraph(CompiledGraph):
                 if is_writable_managed_value(v)
             ]
 
-        def _get_root(input: Any) -> Optional[Sequence[tuple[str, Any]]]:
-            if isinstance(input, Command):
-                if input.graph == Command.PARENT:
-                    return ()
-                return input._update_as_tuples()
-            elif (
-                isinstance(input, (list, tuple))
-                and input
-                and any(isinstance(i, Command) for i in input)
-            ):
-                updates: list[tuple[str, Any]] = []
-                for i in input:
-                    if isinstance(i, Command):
-                        if i.graph == Command.PARENT:
-                            continue
-                        updates.extend(i._update_as_tuples())
-                    else:
-                        updates.append(("__root__", i))
-                return updates
-            elif input is not None:
-                return [("__root__", input)]
-
         def _get_updates(
             input: Union[None, dict, Any],
         ) -> Optional[Sequence[tuple[str, Any]]]:
@@ -766,13 +762,13 @@ class CompiledStateGraph(CompiledGraph):
                 return updates
             elif (t := type(input)) and get_type_hints(t):
                 # Pydantic v2
-                if isinstance(input, BaseModel):
-                    keep: Optional[set[str]] = input.model_fields_set
+                if isinstance(input, BaseModelV1):
+                    keep: Optional[set[str]] = input.__fields_set__
+                    defaults = {k: v.default for k, v in t.__fields__.items()}
+                elif isinstance(input, BaseModel):
+                    keep = input.model_fields_set
                     defaults = {k: v.default for k, v in input.model_fields.items()}
                 # Pydantic v1
-                elif isinstance(input, BaseModelV1):
-                    keep = input.__fields_set__
-                    defaults = {k: v.default for k, v in t.__fields__.items()}
                 else:
                     keep = None
                     defaults = {}
@@ -799,11 +795,12 @@ class CompiledStateGraph(CompiledGraph):
                 raise InvalidUpdateError(msg)
 
         # state updaters
-        write_entries: list[Union[ChannelWriteEntry, ChannelWriteTupleEntry]] = [
+        write_entries: tuple[Union[ChannelWriteEntry, ChannelWriteTupleEntry], ...] = (
             ChannelWriteTupleEntry(
                 mapper=_get_root if output_keys == ["__root__"] else _get_updates
-            )
-        ]
+            ),
+            ChannelWriteTupleEntry(mapper=_control_branch),
+        )
 
         # add node and output channel
         if key == START:
@@ -811,38 +808,32 @@ class CompiledStateGraph(CompiledGraph):
                 tags=[TAG_HIDDEN],
                 triggers=[START],
                 channels=[START],
-                writers=[
-                    ChannelWrite(
-                        write_entries,
-                        tags=[TAG_HIDDEN],
-                    ),
-                ],
+                writers=[ChannelWrite(write_entries, tags=[TAG_HIDDEN])],
             )
         elif node is not None:
             input_schema = node.input if node else self.builder.schema
             input_values = {k: k for k in self.builder.schemas[input_schema]}
             is_single_input = len(input_values) == 1 and "__root__" in input_values
+            if input_schema in self.schema_to_mapper:
+                mapper = self.schema_to_mapper[input_schema]
+            else:
+                mapper = _pick_mapper(
+                    list(input_values),
+                    input_schema,
+                    self.builder.type_hints[input_schema],
+                )
+                self.schema_to_mapper[input_schema] = mapper
 
-            branch_channel = f"branch:to:{key}"
-            self.channels[key] = EphemeralValue(Any, guard=False)
+            branch_channel = CHANNEL_BRANCH_TO.format(key)
             self.channels[branch_channel] = EphemeralValue(Any, guard=False)
             self.nodes[key] = PregelNode(
                 triggers=[branch_channel],
                 # read state keys and managed values
                 channels=(list(input_values) if is_single_input else input_values),
                 # coerce state dict to schema class (eg. pydantic model)
-                mapper=_pick_mapper(
-                    list(input_values),
-                    input_schema,
-                    self.builder.type_hints[input_schema],
-                ),
-                writers=[
-                    # publish to this channel and state keys
-                    ChannelWrite(
-                        write_entries + [ChannelWriteEntry(key, key)],
-                        tags=[TAG_HIDDEN],
-                    ),
-                ],
+                mapper=mapper,
+                # publish to state keys
+                writers=[ChannelWrite(write_entries, tags=[TAG_HIDDEN])],
                 metadata=node.metadata,
                 retry_policy=node.retry_policy,
                 bound=node.runnable,
@@ -852,21 +843,13 @@ class CompiledStateGraph(CompiledGraph):
 
     def attach_edge(self, starts: Union[str, Sequence[str]], end: str) -> None:
         if isinstance(starts, str):
-            if starts == START:
-                channel_name = f"start:{end}"
-                # register channel
-                self.channels[channel_name] = EphemeralValue(Any)
-                # subscribe to channel
-                self.nodes[end].triggers.append(channel_name)
-                # publish to channel
-                self.nodes[START].writers.append(
+            # subscribe to start channel
+            if end != END:
+                self.nodes[starts].writers.append(
                     ChannelWrite(
-                        [ChannelWriteEntry(channel_name, START)], tags=[TAG_HIDDEN]
+                        (ChannelWriteEntry(CHANNEL_BRANCH_TO.format(end), None),)
                     )
                 )
-            elif end != END:
-                # subscribe to start channel
-                self.nodes[end].triggers.append(starts)
         elif end != END:
             channel_name = f"join:{'+'.join(starts)}:{end}"
             # register channel
@@ -877,7 +860,7 @@ class CompiledStateGraph(CompiledGraph):
             for start in starts:
                 self.nodes[start].writers.append(
                     ChannelWrite(
-                        [ChannelWriteEntry(channel_name, start)], tags=[TAG_HIDDEN]
+                        (ChannelWriteEntry(channel_name, start),), tags=[TAG_HIDDEN]
                     )
                 )
 
@@ -890,7 +873,7 @@ class CompiledStateGraph(CompiledGraph):
             if filtered := [p for p in packets if p != END]:
                 writes = [
                     (
-                        ChannelWriteEntry(f"branch:to:{p}", start)
+                        ChannelWriteEntry(CHANNEL_BRANCH_TO.format(p), None)
                         if not isinstance(p, Send)
                         else p
                     )
@@ -909,19 +892,33 @@ class CompiledStateGraph(CompiledGraph):
                     config, cast(Sequence[Union[Send, ChannelWriteEntry]], writes)
                 )
 
-        schema = branch.input_schema or (
-            self.builder.nodes[start].input
-            if start in self.builder.nodes
-            else self.builder.schema
-        )
+        if with_reader:
+            # get schema
+            schema = branch.input_schema or (
+                self.builder.nodes[start].input
+                if start in self.builder.nodes
+                else self.builder.schema
+            )
+            channels = list(self.builder.schemas[schema])
+            # get mapper
+            if schema in self.schema_to_mapper:
+                mapper = self.schema_to_mapper[schema]
+            else:
+                mapper = _pick_mapper(channels, schema, self.builder.type_hints[schema])
+                self.schema_to_mapper[schema] = mapper
+            # create reader
+            reader: Optional[Callable[[RunnableConfig], Any]] = partial(
+                ChannelRead.do_read,
+                select=channels[0] if channels == ["__root__"] else channels,
+                fresh=True,
+                # coerce state dict to schema class (eg. pydantic model)
+                mapper=mapper,
+            )
+        else:
+            reader = None
 
         # attach branch publisher
-        self.nodes[start].writers.append(
-            branch.run(
-                branch_writer,
-                _get_state_reader(self.builder, schema) if with_reader else None,
-            )
-        )
+        self.nodes[start].writers.append(branch.run(branch_writer, reader))
 
         # attach then subscriber
         if branch.then and branch.then != END:
@@ -937,23 +934,113 @@ class CompiledStateGraph(CompiledGraph):
                 if end != END:
                     self.nodes[end].writers.append(
                         ChannelWrite(
-                            [ChannelWriteEntry(channel_name, end)], tags=[TAG_HIDDEN]
+                            (ChannelWriteEntry(channel_name, end),), tags=[TAG_HIDDEN]
                         )
                     )
 
+    def _migrate_checkpoint(self, checkpoint: Checkpoint) -> None:
+        """Migrate a checkpoint to new channel layout."""
 
-def _get_state_reader(
-    builder: StateGraph, schema: Type[Any]
-) -> Callable[[RunnableConfig], Any]:
-    state_keys = list(builder.channels)
-    select = list(builder.schemas[schema])
-    return partial(
-        ChannelRead.do_read,
-        select=select[0] if select == ["__root__"] else select,
-        fresh=True,
-        # coerce state dict to schema class (eg. pydantic model)
-        mapper=_pick_mapper(state_keys, schema, builder.type_hints[schema]),
-    )
+        values = checkpoint["channel_values"]
+        versions = checkpoint["channel_versions"]
+        seen = checkpoint["versions_seen"]
+
+        # empty checkpoints do not need migration
+        if not versions:
+            return
+
+        # current version
+        if checkpoint["v"] >= 3:
+            return
+
+        # Migrate from start:node to branch:to:node
+        for k in list(versions):
+            if k.startswith("start:"):
+                # confirm node is present
+                node = k.split(":")[1]
+                if node not in self.nodes:
+                    continue
+                # get next version
+                new_k = f"branch:to:{node}"
+                new_v = (
+                    max(versions[new_k], versions.pop(k))
+                    if new_k in versions
+                    else versions.pop(k)
+                )
+                # update seen
+                for ss in (seen.get(node, {}), seen.get(INTERRUPT, {})):
+                    if k in ss:
+                        s = ss.pop(k)
+                        if new_k in ss:
+                            ss[new_k] = max(s, ss[new_k])
+                        else:
+                            ss[new_k] = s
+                # update value
+                if new_k not in values and k in values:
+                    values[new_k] = values.pop(k)
+                # update version
+                versions[new_k] = new_v
+
+        # Migrate from branch:source:condition:node to branch:to:node
+        for k in list(versions):
+            if k.startswith("branch:") and k.count(":") == 3:
+                # confirm node is present
+                node = k.split(":")[-1]
+                if node not in self.nodes:
+                    continue
+                # get next version
+                new_k = f"branch:to:{node}"
+                new_v = (
+                    max(versions[new_k], versions.pop(k))
+                    if new_k in versions
+                    else versions.pop(k)
+                )
+                # update seen
+                for ss in (seen.get(node, {}), seen.get(INTERRUPT, {})):
+                    if k in ss:
+                        s = ss.pop(k)
+                        if new_k in ss:
+                            ss[new_k] = max(s, ss[new_k])
+                        else:
+                            ss[new_k] = s
+                # update value
+                if new_k not in values and k in values:
+                    values[new_k] = values.pop(k)
+                # update version
+                versions[new_k] = new_v
+
+        if not set(self.nodes).isdisjoint(versions):
+            # Migrate from "node" to "branch:to:node"
+            source_to_target = defaultdict(list)
+            for start, end in self.builder.edges:
+                if start != START and end != END:
+                    source_to_target[start].append(end)
+            for k in list(versions):
+                if k == START:
+                    continue
+                if k in self.nodes:
+                    v = versions.pop(k)
+                    c = values.pop(k, MISSING)
+                    for end in source_to_target[k]:
+                        # get next version
+                        new_k = f"branch:to:{end}"
+                        new_v = max(versions[new_k], v) if new_k in versions else v
+                        # update seen
+                        for ss in (seen.get(end, {}), seen.get(INTERRUPT, {})):
+                            if k in ss:
+                                s = ss.pop(k)
+                                if new_k in ss:
+                                    ss[new_k] = max(s, ss[new_k])
+                                else:
+                                    ss[new_k] = s
+                        # update value
+                        if new_k not in values and c is not MISSING:
+                            values[new_k] = c
+                        # update version
+                        versions[new_k] = new_v
+                    # pop interrupt seen
+                    if INTERRUPT in seen:
+                        seen[INTERRUPT].pop(k, MISSING)
 
 
 def _pick_mapper(
@@ -965,7 +1052,7 @@ def _pick_mapper(
         if issubclass(schema, dict):
             return None
         if issubclass(schema, (BaseModel, BaseModelV1)):
-            return SchemaCoercionMapper(schema, type_hints)
+            return SchemaCoercionMapper(schema, type_hints=type_hints)
     return partial(_coerce_state, schema)
 
 
@@ -973,9 +1060,9 @@ def _coerce_state(schema: Type[Any], input: dict[str, Any]) -> dict[str, Any]:
     return schema(**input)
 
 
-def _control_branch(value: Any) -> Sequence[Union[str, Send]]:
+def _control_branch(value: Any) -> Sequence[tuple[str, Any]]:
     if isinstance(value, Send):
-        return [value]
+        return ((TASKS, value),)
     commands: list[Command] = []
     if isinstance(value, Command):
         commands.append(value)
@@ -983,51 +1070,45 @@ def _control_branch(value: Any) -> Sequence[Union[str, Send]]:
         for cmd in value:
             if isinstance(cmd, Command):
                 commands.append(cmd)
-    rtn: list[Union[str, Send]] = []
+    rtn: list[tuple[str, Any]] = []
     for command in commands:
         if command.graph == Command.PARENT:
             raise ParentCommand(command)
         if isinstance(command.goto, Send):
-            rtn.append(command.goto)
+            rtn.append((TASKS, command.goto))
         elif isinstance(command.goto, str):
-            rtn.append(command.goto)
+            rtn.append((CHANNEL_BRANCH_TO.format(command.goto), None))
         else:
-            rtn.extend(command.goto)
+            rtn.extend(
+                (TASKS, go)
+                if isinstance(go, Send)
+                else (CHANNEL_BRANCH_TO.format(go), None)
+                for go in command.goto
+            )
     return rtn
 
 
-async def _acontrol_branch(value: Any) -> Sequence[Union[str, Send]]:
-    if isinstance(value, Send):
-        return [value]
-    commands: list[Command] = []
-    if isinstance(value, Command):
-        commands.append(value)
-    elif isinstance(value, (list, tuple)):
-        for cmd in value:
-            if isinstance(cmd, Command):
-                commands.append(cmd)
-    rtn: list[Union[str, Send]] = []
-    for command in commands:
-        if command.graph == Command.PARENT:
-            raise ParentCommand(command)
-        if isinstance(command.goto, Send):
-            rtn.append(command.goto)
-        elif isinstance(command.goto, str):
-            rtn.append(command.goto)
-        else:
-            rtn.extend(command.goto)
-    return rtn
-
-
-CONTROL_BRANCH_PATH = RunnableCallable(
-    _control_branch,
-    _acontrol_branch,
-    tags=[TAG_HIDDEN],
-    trace=False,
-    recurse=False,
-    func_accepts_config=False,
-)
-CONTROL_BRANCH = Branch(CONTROL_BRANCH_PATH, None)
+def _get_root(input: Any) -> Optional[Sequence[tuple[str, Any]]]:
+    if isinstance(input, Command):
+        if input.graph == Command.PARENT:
+            return ()
+        return input._update_as_tuples()
+    elif (
+        isinstance(input, (list, tuple))
+        and input
+        and any(isinstance(i, Command) for i in input)
+    ):
+        updates: list[tuple[str, Any]] = []
+        for i in input:
+            if isinstance(i, Command):
+                if i.graph == Command.PARENT:
+                    continue
+                updates.extend(i._update_as_tuples())
+            else:
+                updates.append(("__root__", i))
+        return updates
+    elif input is not None:
+        return [("__root__", input)]
 
 
 def _get_channels(
@@ -1166,3 +1247,6 @@ def _get_schema(
                     if k in channels and isinstance(channels[k], BaseChannel)
                 },
             )
+
+
+CHANNEL_BRANCH_TO = "branch:to:{}"

@@ -36,7 +36,6 @@ from langchain_core.runnables.config import (
     var_child_runnable_config,
 )
 from langchain_core.runnables.utils import Input, Output
-from langchain_core.tracers._streaming import _StreamingCallbackHandler
 from typing_extensions import TypeGuard
 
 from langgraph.constants import (
@@ -53,6 +52,11 @@ from langgraph.utils.config import (
     get_callback_manager_for_config,
     patch_config,
 )
+
+try:
+    from langchain_core.tracers._streaming import _StreamingCallbackHandler
+except ImportError:
+    _StreamingCallbackHandler = None  # type: ignore
 
 
 def _set_config_context(
@@ -250,6 +254,7 @@ class RunnableCallable(Runnable):
         tags: Optional[Sequence[str]] = None,
         trace: bool = True,
         recurse: bool = True,
+        set_context: bool = True,
         explode_args: bool = False,
         func_accepts_config: Optional[bool] = None,
         **kwargs: Any,
@@ -273,6 +278,7 @@ class RunnableCallable(Runnable):
         self.kwargs = kwargs
         self.trace = trace
         self.recurse = recurse
+        self.set_context = set_context
         self.explode_args = explode_args
         # check signature
         if func is None and afunc is None:
@@ -359,17 +365,22 @@ class RunnableCallable(Runnable):
             )
             try:
                 child_config = patch_config(config, callbacks=run_manager.get_child())
-                with set_config_context(child_config) as context:
-                    ret = context.run(self.func, *args, **kwargs)
+                if self.set_context:
+                    with set_config_context(child_config) as context:
+                        ret = context.run(self.func, *args, **kwargs)
+                else:
+                    ret = self.func(*args, **kwargs)
             except BaseException as e:
                 run_manager.on_chain_error(e)
                 raise
             else:
                 run_manager.on_chain_end(ret)
-        else:
+        elif self.set_context:
             with set_config_context(config) as context:
                 ret = context.run(self.func, *args, **kwargs)
-        if isinstance(ret, Runnable) and self.recurse:
+        else:
+            ret = self.func(*args, **kwargs)
+        if self.recurse and isinstance(ret, Runnable):
             return ret.invoke(input, config)
         return ret
 
@@ -413,25 +424,24 @@ class RunnableCallable(Runnable):
             )
             try:
                 child_config = patch_config(config, callbacks=run_manager.get_child())
-                with set_config_context(child_config) as context:
-                    coro = cast(Coroutine[None, None, Any], self.afunc(*args, **kwargs))
-                    if ASYNCIO_ACCEPTS_CONTEXT:
+                coro = cast(Coroutine[None, None, Any], self.afunc(*args, **kwargs))
+                if ASYNCIO_ACCEPTS_CONTEXT and self.set_context:
+                    with set_config_context(child_config) as context:
                         ret = await asyncio.create_task(coro, context=context)
-                    else:
-                        ret = await coro
+                else:
+                    ret = await coro
             except BaseException as e:
                 await run_manager.on_chain_error(e)
                 raise
             else:
                 await run_manager.on_chain_end(ret)
-        else:
+        elif ASYNCIO_ACCEPTS_CONTEXT and self.set_context:
             with set_config_context(config) as context:
-                if ASYNCIO_ACCEPTS_CONTEXT:
-                    coro = cast(Coroutine[None, None, Any], self.afunc(*args, **kwargs))
-                    ret = await asyncio.create_task(coro, context=context)
-                else:
-                    ret = await self.afunc(*args, **kwargs)
-        if isinstance(ret, Runnable) and self.recurse:
+                coro = cast(Coroutine[None, None, Any], self.afunc(*args, **kwargs))
+                ret = await asyncio.create_task(coro, context=context)
+        else:
+            ret = await self.afunc(*args, **kwargs)
+        if self.recurse and isinstance(ret, Runnable):
             return await ret.ainvoke(input, config)
         return ret
 
@@ -683,13 +693,15 @@ class RunnableSeq(Runnable):
                     iterator = step.stream(input, config, **kwargs)
                 else:
                     iterator = step.transform(iterator, config)
-            if stream_handler := next(
-                (
-                    cast(_StreamingCallbackHandler, h)
-                    for h in run_manager.handlers
-                    if isinstance(h, _StreamingCallbackHandler)
-                ),
-                None,
+            if _StreamingCallbackHandler is not None and (
+                stream_handler := next(
+                    (
+                        cast(_StreamingCallbackHandler, h)
+                        for h in run_manager.handlers
+                        if isinstance(h, _StreamingCallbackHandler)
+                    ),
+                    None,
+                )
             ):
                 # populates streamed_output in astream_log() output if needed
                 iterator = stream_handler.tap_output_iter(run_manager.run_id, iterator)
@@ -749,13 +761,15 @@ class RunnableSeq(Runnable):
                         aiterator = step.atransform(aiterator, config)
                     if hasattr(aiterator, "aclose"):
                         stack.push_async_callback(aiterator.aclose)
-                if stream_handler := next(
-                    (
-                        cast(_StreamingCallbackHandler, h)
-                        for h in run_manager.handlers
-                        if isinstance(h, _StreamingCallbackHandler)
-                    ),
-                    None,
+                if _StreamingCallbackHandler is not None and (
+                    stream_handler := next(
+                        (
+                            cast(_StreamingCallbackHandler, h)
+                            for h in run_manager.handlers
+                            if isinstance(h, _StreamingCallbackHandler)
+                        ),
+                        None,
+                    )
                 ):
                     # populates streamed_output in astream_log() output if needed
                     aiterator = stream_handler.tap_output_aiter(

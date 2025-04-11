@@ -2,13 +2,14 @@ import json
 import pathlib
 import shutil
 import tempfile
+import textwrap
 from contextlib import contextmanager
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from langgraph_cli.cli import cli, prepare_args_and_stdin
-from langgraph_cli.config import Config, validate_config
+from langgraph_cli.config import PIP_CLEANUP_LINES, Config, validate_config
 from langgraph_cli.docker import DEFAULT_POSTGRES_URI, DockerCapabilities, Version
 from langgraph_cli.util import clean_empty_lines
 
@@ -143,6 +144,7 @@ services:
                 RUN PYTHONDONTWRITEBYTECODE=1 pip install --no-cache-dir -c /api/constraints.txt -e /deps/*
                 # -- End of local dependencies install --
                 ENV LANGSERVE_GRAPHS='{{"agent": "agent.py:graph"}}'
+{textwrap.indent(textwrap.dedent(PIP_CLEANUP_LINES), "                ")}
                 WORKDIR /deps/cli
         
         develop:
@@ -176,12 +178,57 @@ def test_dockerfile_command_basic() -> None:
     """Test the 'dockerfile' command with basic configuration."""
     runner = CliRunner()
     config_content = {
-        "node_version": "20",  # Add any other necessary configuration fields
+        "python_version": "3.11",
         "graphs": {"agent": "agent.py:graph"},
+        "dependencies": ["."],
     }
 
     with temporary_config_folder(config_content) as temp_dir:
         save_path = temp_dir / "Dockerfile"
+
+        result = runner.invoke(
+            cli,
+            ["dockerfile", str(save_path), "--config", str(temp_dir / "config.json")],
+        )
+
+        # Assert command was successful
+        assert result.exit_code == 0, result.output
+        assert "✅ Created: Dockerfile" in result.output
+
+        # Check if Dockerfile was created
+        assert save_path.exists()
+
+
+def test_dockerfile_command_new_style_config() -> None:
+    """Test `dockerfile` command with a new style config.
+
+    This config format allows specifying agent data as a dictionary.
+    {
+        "graphs": {
+            "agent1": {
+                "path": ... # path to graph definition,
+                ... # other fields
+            }
+        }
+    }
+    """
+    runner = CliRunner()
+    config_content = {
+        "dependencies": ["./my_agent"],
+        "graphs": {
+            "agent": {
+                "path": "./my_agent/agent.py:graph",
+                "description": "This is a test agent",
+            }
+        },
+        "env": ".env",
+    }
+    with temporary_config_folder(config_content) as temp_dir:
+        save_path = temp_dir / "Dockerfile"
+        # Add agent.py file
+        agent_path = temp_dir / "my_agent" / "agent.py"
+        agent_path.parent.mkdir(parents=True, exist_ok=True)
+        agent_path.touch()
 
         result = runner.invoke(
             cli,

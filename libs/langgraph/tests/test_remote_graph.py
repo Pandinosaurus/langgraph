@@ -12,6 +12,7 @@ from langgraph_sdk.schema import StreamPart
 from langgraph.errors import GraphInterrupt
 from langgraph.pregel.remote import RemoteGraph
 from langgraph.pregel.types import StateSnapshot
+from langgraph.types import Interrupt
 
 
 def test_with_config():
@@ -415,7 +416,19 @@ def test_stream():
         StreamPart(event="values", data={"chunk": "data2"}),
         StreamPart(event="values", data={"chunk": "data3"}),
         StreamPart(event="updates", data={"chunk": "data4"}),
-        StreamPart(event="updates", data={"__interrupt__": ()}),
+        StreamPart(
+            event="updates",
+            data={
+                "__interrupt__": [
+                    {
+                        "value": {"question": "Does this look good?"},
+                        "resumable": True,
+                        "ns": ["some_ns"],
+                        "when": "during",
+                    }
+                ]
+            },
+        ),
     ]
 
     # call method / assertions
@@ -424,15 +437,35 @@ def test_stream():
         sync_client=mock_sync_client,
     )
 
-    # stream modes doesn't include 'updates'
-    stream_parts = []
-    with pytest.raises(GraphInterrupt):
+    # test raising graph interrupt if invoked as a subgraph
+    with pytest.raises(GraphInterrupt) as exc:
         for stream_part in remote_pregel.stream(
             {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
+            # pretend we invoked this as a subgraph
+            config={
+                "configurable": {"thread_id": "thread_1", "checkpoint_ns": "some_ns"}
+            },
             stream_mode="values",
         ):
-            stream_parts.append(stream_part)
+            pass
+
+    assert exc.value.args[0] == [
+        Interrupt(
+            value={"question": "Does this look good?"},
+            resumable=True,
+            ns=["some_ns"],
+            when="during",
+        )
+    ]
+
+    # stream modes doesn't include 'updates'
+    stream_parts = []
+    for stream_part in remote_pregel.stream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        stream_mode="values",
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         {"chunk": "data1"},
@@ -448,62 +481,62 @@ def test_stream():
 
     # default stream_mode is updates
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        for stream_part in remote_pregel.stream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-        ):
-            stream_parts.append(stream_part)
+    for stream_part in remote_pregel.stream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         {"chunk": "data3"},
         {"chunk": "data4"},
+        {"__interrupt__": ()},
     ]
 
     # list stream_mode includes mode names
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        for stream_part in remote_pregel.stream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            stream_mode=["updates"],
-        ):
-            stream_parts.append(stream_part)
+    for stream_part in remote_pregel.stream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        stream_mode=["updates"],
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         ("updates", {"chunk": "data3"}),
         ("updates", {"chunk": "data4"}),
+        ("updates", {"__interrupt__": ()}),
     ]
 
     # subgraphs + list modes
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        for stream_part in remote_pregel.stream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            stream_mode=["updates"],
-            subgraphs=True,
-        ):
-            stream_parts.append(stream_part)
+    for stream_part in remote_pregel.stream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        stream_mode=["updates"],
+        subgraphs=True,
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         ((), "updates", {"chunk": "data3"}),
         ((), "updates", {"chunk": "data4"}),
+        ((), "updates", {"__interrupt__": ()}),
     ]
 
     # subgraphs + single mode
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        for stream_part in remote_pregel.stream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            subgraphs=True,
-        ):
-            stream_parts.append(stream_part)
+    for stream_part in remote_pregel.stream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        subgraphs=True,
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         ((), {"chunk": "data3"}),
         ((), {"chunk": "data4"}),
+        ((), {"__interrupt__": ()}),
     ]
 
 
@@ -517,7 +550,19 @@ async def test_astream():
         StreamPart(event="values", data={"chunk": "data2"}),
         StreamPart(event="values", data={"chunk": "data3"}),
         StreamPart(event="updates", data={"chunk": "data4"}),
-        StreamPart(event="updates", data={"__interrupt__": ()}),
+        StreamPart(
+            event="updates",
+            data={
+                "__interrupt__": [
+                    {
+                        "value": {"question": "Does this look good?"},
+                        "resumable": True,
+                        "ns": ["some_ns"],
+                        "when": "during",
+                    }
+                ]
+            },
+        ),
     ]
     mock_async_client.runs.stream.return_value = async_iter
 
@@ -527,15 +572,35 @@ async def test_astream():
         client=mock_async_client,
     )
 
-    # stream modes doesn't include 'updates'
-    stream_parts = []
-    with pytest.raises(GraphInterrupt):
+    # test raising graph interrupt if invoked as a subgraph
+    with pytest.raises(GraphInterrupt) as exc:
         async for stream_part in remote_pregel.astream(
             {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
+            # pretend we invoked this as a subgraph
+            config={
+                "configurable": {"thread_id": "thread_1", "checkpoint_ns": "some_ns"}
+            },
             stream_mode="values",
         ):
-            stream_parts.append(stream_part)
+            pass
+
+    assert exc.value.args[0] == [
+        Interrupt(
+            value={"question": "Does this look good?"},
+            resumable=True,
+            ns=["some_ns"],
+            when="during",
+        )
+    ]
+
+    # stream modes doesn't include 'updates'
+    stream_parts = []
+    async for stream_part in remote_pregel.astream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        stream_mode="values",
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         {"chunk": "data1"},
@@ -553,62 +618,62 @@ async def test_astream():
 
     # default stream_mode is updates
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        async for stream_part in remote_pregel.astream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-        ):
-            stream_parts.append(stream_part)
+    async for stream_part in remote_pregel.astream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         {"chunk": "data3"},
         {"chunk": "data4"},
+        {"__interrupt__": ()},
     ]
 
     # list stream_mode includes mode names
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        async for stream_part in remote_pregel.astream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            stream_mode=["updates"],
-        ):
-            stream_parts.append(stream_part)
+    async for stream_part in remote_pregel.astream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        stream_mode=["updates"],
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         ("updates", {"chunk": "data3"}),
         ("updates", {"chunk": "data4"}),
+        ("updates", {"__interrupt__": ()}),
     ]
 
     # subgraphs + list modes
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        async for stream_part in remote_pregel.astream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            stream_mode=["updates"],
-            subgraphs=True,
-        ):
-            stream_parts.append(stream_part)
+    async for stream_part in remote_pregel.astream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        stream_mode=["updates"],
+        subgraphs=True,
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         ((), "updates", {"chunk": "data3"}),
         ((), "updates", {"chunk": "data4"}),
+        ((), "updates", {"__interrupt__": ()}),
     ]
 
     # subgraphs + single mode
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        async for stream_part in remote_pregel.astream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            subgraphs=True,
-        ):
-            stream_parts.append(stream_part)
+    async for stream_part in remote_pregel.astream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        subgraphs=True,
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         ((), {"chunk": "data3"}),
         ((), {"chunk": "data4"}),
+        ((), {"__interrupt__": ()}),
     ]
 
     async_iter = MagicMock()
@@ -621,33 +686,33 @@ async def test_astream():
 
     # subgraphs + list modes
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        async for stream_part in remote_pregel.astream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            stream_mode=["updates"],
-            subgraphs=True,
-        ):
-            stream_parts.append(stream_part)
+    async for stream_part in remote_pregel.astream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        stream_mode=["updates"],
+        subgraphs=True,
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         (("my", "subgraph"), "updates", {"chunk": "data3"}),
         (("hello", "subgraph"), "updates", {"chunk": "data4"}),
+        (("bye", "subgraph"), "updates", {"__interrupt__": ()}),
     ]
 
     # subgraphs + single mode
     stream_parts = []
-    with pytest.raises(GraphInterrupt):
-        async for stream_part in remote_pregel.astream(
-            {"input": "data"},
-            config={"configurable": {"thread_id": "thread_1"}},
-            subgraphs=True,
-        ):
-            stream_parts.append(stream_part)
+    async for stream_part in remote_pregel.astream(
+        {"input": "data"},
+        config={"configurable": {"thread_id": "thread_1"}},
+        subgraphs=True,
+    ):
+        stream_parts.append(stream_part)
 
     assert stream_parts == [
         (("my", "subgraph"), {"chunk": "data3"}),
         (("hello", "subgraph"), {"chunk": "data4"}),
+        (("bye", "subgraph"), {"__interrupt__": ()}),
     ]
 
 
