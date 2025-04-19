@@ -30,6 +30,7 @@ from langgraph.checkpoint.serde.types import (
 
 V = TypeVar("V", int, float, str)
 PendingWrite = Tuple[str, str, Any]
+# Kept for backwards compat, newer versions of LangGraph no longer use this.
 LATEST_VERSION = 2
 
 
@@ -100,6 +101,7 @@ class Checkpoint(TypedDict):
     Cleared by the next checkpoint."""
 
 
+# Kept for backwards compat, newer versions of LangGraph no longer use this.
 def empty_checkpoint() -> Checkpoint:
     return Checkpoint(
         v=LATEST_VERSION,
@@ -124,6 +126,7 @@ def copy_checkpoint(checkpoint: Checkpoint) -> Checkpoint:
     )
 
 
+# Kept for backwards compat, newer versions of LangGraph no longer use this.
 def create_checkpoint(
     checkpoint: Checkpoint,
     channels: Optional[Mapping[str, ChannelProtocol]],
@@ -318,6 +321,17 @@ class BaseCheckpointSaver(Generic[V]):
         """
         raise NotImplementedError
 
+    def delete_thread(
+        self,
+        thread_id: str,
+    ) -> None:
+        """Delete all checkpoints and writes associated with a specific thread ID.
+
+        Args:
+            thread_id (str): The thread ID whose checkpoints should be deleted.
+        """
+        raise NotImplementedError
+
     async def aget(self, config: RunnableConfig) -> Optional[Checkpoint]:
         """Asynchronously fetch a checkpoint using the given configuration.
 
@@ -409,6 +423,17 @@ class BaseCheckpointSaver(Generic[V]):
 
         Raises:
             NotImplementedError: Implement this method in your custom checkpoint saver.
+        """
+        raise NotImplementedError
+
+    async def adelete_thread(
+        self,
+        thread_id: str,
+    ) -> None:
+        """Delete all checkpoints and writes associated with a specific thread ID.
+
+        Args:
+            thread_id (str): The thread ID whose checkpoints should be deleted.
         """
         raise NotImplementedError
 

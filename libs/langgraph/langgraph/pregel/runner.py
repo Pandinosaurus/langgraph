@@ -44,6 +44,18 @@ from langgraph.utils.future import chain_future
 F = TypeVar("F", concurrent.futures.Future, asyncio.Future)
 E = TypeVar("E", threading.Event, asyncio.Event)
 
+# List of filenames to exclude from exception traceback
+# Note: Frames will be removed if they are the last frame in traceback, recursively
+EXCLUDED_FRAME_FNAMES = (
+    "langgraph/pregel/retry.py",
+    "langgraph/pregel/runner.py",
+    "langgraph/pregel/executor.py",
+    "langgraph/utils/runnable.py",
+    "langchain_core/runnables/config.py",
+    "concurrent/futures/thread.py",
+    "concurrent/futures/_base.py",
+)
+
 
 class FuturesDict(Generic[F, E], dict[F, Optional[PregelExecutableTask]]):
     event: E
@@ -128,7 +140,7 @@ class PregelRunner:
         *,
         reraise: bool = True,
         timeout: Optional[float] = None,
-        retry_policy: Optional[RetryPolicy] = None,
+        retry_policy: Optional[Sequence[RetryPolicy]] = None,
         get_waiter: Optional[Callable[[], concurrent.futures.Future[None]]] = None,
     ) -> Iterator[None]:
         tasks = tuple(tasks)
@@ -167,6 +179,13 @@ class PregelRunner:
                     fut.set_exception(exc)
                     futures.done.add(fut)
                 elif reraise:
+                    if tb := exc.__traceback__:
+                        while tb.tb_next is not None and any(
+                            tb.tb_frame.f_code.co_filename.endswith(name)
+                            for name in EXCLUDED_FRAME_FNAMES
+                        ):
+                            tb = tb.tb_next
+                        exc.__traceback__ = tb
                     raise
             if not futures:  # maybe `t` schuduled another task
                 return
@@ -229,10 +248,20 @@ class PregelRunner:
         # give control back to the caller
         yield
         # panic on failure or timeout
-        _panic_or_proceed(
-            futures.done.union(f for f, t in futures.items() if t is not None),
-            panic=reraise,
-        )
+        try:
+            _panic_or_proceed(
+                futures.done.union(f for f, t in futures.items() if t is not None),
+                panic=reraise,
+            )
+        except Exception as exc:
+            if tb := exc.__traceback__:
+                while tb.tb_next is not None and any(
+                    tb.tb_frame.f_code.co_filename.endswith(name)
+                    for name in EXCLUDED_FRAME_FNAMES
+                ):
+                    tb = tb.tb_next
+                exc.__traceback__ = tb
+            raise
 
     async def atick(
         self,
@@ -240,7 +269,7 @@ class PregelRunner:
         *,
         reraise: bool = True,
         timeout: Optional[float] = None,
-        retry_policy: Optional[RetryPolicy] = None,
+        retry_policy: Optional[Sequence[RetryPolicy]] = None,
         get_waiter: Optional[Callable[[], asyncio.Future[None]]] = None,
     ) -> AsyncIterator[None]:
         loop = asyncio.get_event_loop()
@@ -283,6 +312,13 @@ class PregelRunner:
                     fut.set_exception(exc)
                     futures.done.add(fut)
                 elif reraise:
+                    if tb := exc.__traceback__:
+                        while tb.tb_next is not None and any(
+                            tb.tb_frame.f_code.co_filename.endswith(name)
+                            for name in EXCLUDED_FRAME_FNAMES
+                        ):
+                            tb = tb.tb_next
+                        exc.__traceback__ = tb
                     raise
             if not futures:  # maybe `t` schuduled another task
                 return
@@ -357,11 +393,21 @@ class PregelRunner:
         for fut in futures:
             fut.cancel()
         # panic on failure or timeout
-        _panic_or_proceed(
-            futures.done.union(f for f, t in futures.items() if t is not None),
-            timeout_exc_cls=asyncio.TimeoutError,
-            panic=reraise,
-        )
+        try:
+            _panic_or_proceed(
+                futures.done.union(f for f, t in futures.items() if t is not None),
+                timeout_exc_cls=asyncio.TimeoutError,
+                panic=reraise,
+            )
+        except Exception as exc:
+            if tb := exc.__traceback__:
+                while tb.tb_next is not None and any(
+                    tb.tb_frame.f_code.co_filename.endswith(name)
+                    for name in EXCLUDED_FRAME_FNAMES
+                ):
+                    tb = tb.tb_next
+                exc.__traceback__ = tb
+            raise
 
     def commit(
         self,
@@ -473,7 +519,7 @@ def _call(
     func: Callable[[Any], Union[Awaitable[Any], Any]],
     input: Any,
     *,
-    retry: Optional[RetryPolicy] = None,
+    retry: Optional[Sequence[RetryPolicy]] = None,
     callbacks: Callbacks = None,
     futures: weakref.ref[FuturesDict],
     schedule_task: weakref.ref[
@@ -554,7 +600,7 @@ def _acall(
     func: Callable[[Any], Union[Awaitable[Any], Any]],
     input: Any,
     *,
-    retry: Optional[RetryPolicy] = None,
+    retry: Optional[Sequence[RetryPolicy]] = None,
     callbacks: Callbacks = None,
     # injected dependencies
     futures: weakref.ref[FuturesDict],

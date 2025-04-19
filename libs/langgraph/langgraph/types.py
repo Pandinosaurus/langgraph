@@ -23,6 +23,7 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from typing_extensions import Self
 
 from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointMetadata
+from langgraph.utils.fields import get_update_as_tuples
 
 if TYPE_CHECKING:
     from langgraph.pregel.protocol import PregelProtocol
@@ -75,6 +76,10 @@ def default_retry_on(exc: Exception) -> bool:
 
     if isinstance(exc, ConnectionError):
         return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 500 <= exc.response.status_code < 600
+    if isinstance(exc, requests.HTTPError):
+        return 500 <= exc.response.status_code < 600 if exc.response else True
     if isinstance(
         exc,
         (
@@ -93,15 +98,14 @@ def default_retry_on(exc: Exception) -> bool:
         ),
     ):
         return False
-    if isinstance(exc, httpx.HTTPStatusError):
-        return 500 <= exc.response.status_code < 600
-    if isinstance(exc, requests.HTTPError):
-        return 500 <= exc.response.status_code < 600 if exc.response else True
     return True
 
 
 class RetryPolicy(NamedTuple):
-    """Configuration for retrying nodes."""
+    """Configuration for retrying nodes.
+
+    !!! version-added "Added in version 0.2.24."
+    """
 
     initial_interval: float = 0.5
     """Amount of time that must elapse before the first retry occurs. In seconds."""
@@ -120,13 +124,20 @@ class RetryPolicy(NamedTuple):
 
 
 class CachePolicy(NamedTuple):
-    """Configuration for caching nodes."""
+    """Configuration for caching nodes.
+
+    !!! version-added "Added in version 0.2.24."
+    """
 
     pass
 
 
 @dataclasses.dataclass(**_DC_KWARGS)
 class Interrupt:
+    """
+    !!! version-added "Added in version 0.2.24."
+    """
+
     value: Any
     resumable: bool = False
     ns: Optional[Sequence[str]] = None
@@ -162,7 +173,7 @@ class PregelExecutableTask:
     writes: deque[tuple[str, Any]]
     config: RunnableConfig
     triggers: Sequence[str]
-    retry_policy: Optional[RetryPolicy]
+    retry_policy: Optional[Sequence[RetryPolicy]]
     cache_policy: Optional[CachePolicy]
     id: str
     path: tuple[Union[str, int, tuple], ...]
@@ -268,6 +279,8 @@ N = TypeVar("N", bound=Hashable)
 class Command(Generic[N], ToolOutputMixin):
     """One or more commands to update the graph's state and send messages to nodes.
 
+    !!! version-added "Added in version 0.2.24."
+
     Args:
         graph: graph to send the command to. Supported values are:
 
@@ -306,7 +319,7 @@ class Command(Generic[N], ToolOutputMixin):
         ):
             return self.update
         elif hints := get_type_hints(type(self.update)):
-            return [(k, getattr(self.update, k)) for k in hints]
+            return get_update_as_tuples(self.update, tuple(hints.keys()))
         elif self.update is not None:
             return [("__root__", self.update)]
         else:
@@ -357,7 +370,7 @@ class LoopProtocol:
         self.stop = stop
 
 
-@dataclasses.dataclass(**{**_DC_KWARGS, "frozen": False})
+@dataclasses.dataclass(**_DC_KWARGS)
 class PregelScratchpad:
     # call
     call_counter: Callable[[], int]

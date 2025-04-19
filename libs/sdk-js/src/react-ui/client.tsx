@@ -109,6 +109,7 @@ class ComponentStore {
 const COMPONENT_STORE = new ComponentStore();
 const EXT_STORE_SYMBOL = Symbol.for("LGUI_EXT_STORE");
 const REQUIRE_SYMBOL = Symbol.for("LGUI_REQUIRE");
+const REQUIRE_EXTRA_SYMBOL = Symbol.for("LGUI_REQUIRE_EXTRA");
 
 interface LoadExternalComponentProps
   extends Pick<React.HTMLAttributes<HTMLDivElement>, "style" | "className"> {
@@ -174,7 +175,11 @@ export function LoadExternalComponent({
   }, [uiClient, uiNamespace, message.name, shadowRootId, hasClientComponent]);
 
   if (hasClientComponent) {
-    return React.createElement(clientComponent, message.props);
+    return (
+      <UseStreamContext.Provider value={{ stream, meta }}>
+        {React.createElement(clientComponent, message.props)}
+      </UseStreamContext.Provider>
+    );
   }
 
   return (
@@ -197,7 +202,15 @@ declare global {
   interface Window {
     [EXT_STORE_SYMBOL]: ComponentStore;
     [REQUIRE_SYMBOL]: (name: string) => unknown;
+    [REQUIRE_EXTRA_SYMBOL]: Record<string, unknown>;
   }
+}
+
+export function experimental_loadShare(name: string, module: unknown) {
+  if (typeof window === "undefined") return;
+
+  window[REQUIRE_EXTRA_SYMBOL] ??= {};
+  window[REQUIRE_EXTRA_SYMBOL][name] = module;
 }
 
 export function bootstrapUiContext() {
@@ -222,6 +235,14 @@ export function bootstrapUiContext() {
           throw new Error("Nesting LoadExternalComponent is not supported");
         },
       };
+    }
+
+    if (
+      window[REQUIRE_EXTRA_SYMBOL] != null &&
+      typeof window[REQUIRE_EXTRA_SYMBOL] === "object" &&
+      name in window[REQUIRE_EXTRA_SYMBOL]
+    ) {
+      return window[REQUIRE_EXTRA_SYMBOL][name];
     }
 
     throw new Error(`Unknown module...: ${name}`);

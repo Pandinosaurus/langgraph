@@ -684,7 +684,7 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
             store.put(("docs",), "doc2", {"text": "Other guide"}, index=False) # don't index
 
             # Search by similarity
-            results = store.search(("docs",), "programming guides", limit=2)
+            results = store.search(("docs",), query="programming guides", limit=2)
         ```
 
     Note:
@@ -1320,7 +1320,7 @@ def _ensure_index_config(
     index_config = index_config.copy()
     tokenized: list[tuple[str, Union[Literal["$"], list[str]]]] = []
     tot = 0
-    text_fields = index_config.get("text_fields") or ["$"]
+    text_fields = index_config.get("fields") or ["$"]
     if isinstance(text_fields, str):
         text_fields = [text_fields]
     if not isinstance(text_fields, list):
