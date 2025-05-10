@@ -1,6 +1,8 @@
 ---
 title: Reference
 description: API reference for LangGraph
+search:
+  boost: 0.5
 ---
 
 <style>
@@ -14,4 +16,7 @@ description: API reference for LangGraph
 
 Welcome to the LangGraph API reference! This reference provides detailed information about the LangGraph API, including classes, methods, and other components.
 
-If you are new to LangGraph, we recommend starting with the [Quick Start](../tutorials/introduction.ipynb) in the Tutorials section.
+!!! tip
+
+    If you are new to LangGraph, we recommend starting with [LangGraph basics](../concepts/why-langgraph.md).
+
